@@ -1,0 +1,434 @@
+name: 6. Auto-Fix Build Errors (Claude AI)
+run-name: Auto-Fix › ${{ github.event.workflow_run.head_branch }} (Run #${{ github.event.workflow_run.run_number }})
+
+on:
+  workflow_run:
+    workflows: ["4. Build iAPS"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+env:
+  GH_TOKEN: ${{ secrets.GH_PAT }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+  FAILED_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+  FAILED_BRANCH: ${{ github.event.workflow_run.head_branch }}
+  FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
+
+jobs:
+  analyze-and-fix:
+    name: Analyze Failure & Auto-Fix
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.event.workflow_run.head_branch }}
+          submodules: false
+          fetch-depth: 20
+
+      - name: Download build artifacts from failed run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ env.FAILED_RUN_ID }}
+          github-token: ${{ secrets.GH_PAT }}
+          path: build-artifacts
+        continue-on-error: true  # artifacts may not exist if build failed early
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install requests --quiet
+
+      - name: Extract build log & analyze with Claude
+        id: analyze
+        run: |
+          python3 << 'EOF'
+          import os, json, glob, subprocess, requests, sys
+
+          GITHUB_OUTPUT = os.environ['GITHUB_OUTPUT']
+          GH_TOKEN = os.environ.get('GH_TOKEN', '')
+          REPO = os.environ.get('GITHUB_REPOSITORY', '')
+          RUN_ID = os.environ.get('FAILED_RUN_ID', '')
+          BRANCH = os.environ.get('FAILED_BRANCH', 'unknown')
+          ANTHROPIC_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+
+          def write_output(key, value):
+              with open(GITHUB_OUTPUT, 'a') as f:
+                  f.write(f"{key}={value}\n")
+
+          def find_artifact_log():
+              patterns = ['build-artifacts/**/*.log', 'build-artifacts/**/*.txt']
+              for p in patterns:
+                  files = glob.glob(p, recursive=True)
+                  if files:
+                      files.sort(key=lambda f: os.path.getsize(f), reverse=True)
+                      return files[0]
+              return None
+
+          def fetch_job_log_from_api():
+              headers = {
+                  'Authorization': f'token {GH_TOKEN}',
+                  'Accept': 'application/vnd.github.v3+json'
+              }
+              jobs_resp = requests.get(
+                  f'https://api.github.com/repos/{REPO}/actions/runs/{RUN_ID}/jobs',
+                  headers=headers, timeout=30
+              )
+              if jobs_resp.status_code != 200:
+                  return None
+              jobs = jobs_resp.json().get('jobs', [])
+              # Prefer the "Build" job that actually failed
+              failed = next(
+                  (j for j in jobs if j['conclusion'] == 'failure' and 'build' in j['name'].lower()),
+                  next((j for j in jobs if j['conclusion'] == 'failure'), None)
+              )
+              if not failed:
+                  return None
+              log_resp = requests.get(
+                  f'https://api.github.com/repos/{REPO}/actions/jobs/{failed["id"]}/logs',
+                  headers=headers, allow_redirects=True, timeout=60
+              )
+              if log_resp.status_code == 200:
+                  return log_resp.text[-20000:]  # last 20 KB (most relevant errors)
+              return None
+
+          # --- Collect error log ---
+          error_log = ''
+          log_source = 'none'
+          log_file = find_artifact_log()
+          if log_file:
+              with open(log_file, 'rb') as f:
+                  error_log = f.read().decode('utf-8', errors='replace')[-15000:]
+              log_source = log_file
+              print(f"Using artifact log: {log_file} ({len(error_log)} chars)")
+          else:
+              print("No artifact log found — fetching from GitHub API...")
+              error_log = fetch_job_log_from_api() or 'No build log available'
+              log_source = 'github_api'
+              print(f"Fetched log via API ({len(error_log)} chars)")
+
+          # --- Collect workflow context ---
+          try:
+              commits = subprocess.check_output(['git', 'log', '--oneline', '-10'], text=True)
+          except Exception:
+              commits = '(unavailable)'
+
+          try:
+              with open('.github/workflows/build_iAPS.yml') as f:
+                  build_wf = f.read()[:4000]
+          except Exception:
+              build_wf = '(unavailable)'
+
+          # --- Check API key ---
+          if not ANTHROPIC_KEY:
+              print("::warning::ANTHROPIC_API_KEY secret is not set — skipping AI analysis.")
+              write_output('analysis_success', 'false')
+              write_output('skip_reason', 'no_api_key')
+              sys.exit(0)
+
+          # --- Call Claude API ---
+          system_prompt = (
+              "You are a senior iOS/Swift build engineer specializing in the iAPS (FreeAPS X) "
+              "closed-loop insulin delivery app. iAPS is built with Xcode + Fastlane and distributed "
+              "via TestFlight. You analyze CI/CD build failures and return structured JSON with precise, "
+              "actionable fixes. Common failure causes: wrong Xcode version in workflow, Swift Package "
+              "Manager dependency failures, code signing / provisioning issues, Swift compilation errors "
+              "after upstream merges, Fastlane API credential issues, expired certificates."
+          )
+          user_msg = (
+              f"A GitHub Actions build failed on branch `{BRANCH}`.\n\n"
+              f"**Recent commits:**\n```\n{commits}\n```\n\n"
+              f"**Current .github/workflows/build_iAPS.yml (first 4000 chars):**\n```yaml\n{build_wf}\n```\n\n"
+              f"**Build error log (last portion):**\n```\n{error_log}\n```\n\n"
+              "Return ONLY a JSON object — no markdown, no explanation — with these exact keys:\n"
+              "{\n"
+              '  "error_summary": "1-2 sentence summary",\n'
+              '  "error_type": "xcode_version|swift_compilation|code_signing|spm_dependency|fastlane|credentials|other",\n'
+              '  "root_cause": "Detailed root cause explanation",\n'
+              '  "fix_type": "workflow_change|code_change|config_change|manual_required",\n'
+              '  "fix_description": "What must be changed to fix this",\n'
+              '  "fix_changes": [\n'
+              '    {"file": "path/to/file", "search": "exact unique string to find", "replace": "replacement string"}\n'
+              "  ],\n"
+              '  "confidence": 0.0,\n'
+              '  "user_action_required": "What the user must do manually (empty string if nothing)"\n'
+              "}\n\n"
+              "Rules for fix_changes:\n"
+              "- Only include if fix_type is workflow_change or code_change AND you are highly confident\n"
+              "- search must be unique enough to match exactly one location in the file\n"
+              "- confidence >= 0.85 triggers automatic PR creation, so be conservative\n"
+          )
+
+          resp = requests.post(
+              'https://api.anthropic.com/v1/messages',
+              headers={
+                  'x-api-key': ANTHROPIC_KEY,
+                  'anthropic-version': '2023-06-01',
+                  'content-type': 'application/json',
+              },
+              json={
+                  'model': 'claude-opus-4-6',
+                  'max_tokens': 2048,
+                  'system': system_prompt,
+                  'messages': [{'role': 'user', 'content': user_msg}],
+              },
+              timeout=60
+          )
+
+          if resp.status_code != 200:
+              print(f"::error::Claude API error {resp.status_code}: {resp.text[:500]}")
+              write_output('analysis_success', 'false')
+              sys.exit(0)
+
+          raw = resp.json()['content'][0]['text'].strip()
+          # Strip markdown code fences if present
+          if raw.startswith('```'):
+              raw = raw.split('```')[1]
+              if raw.startswith('json'):
+                  raw = raw[4:]
+              raw = raw.rstrip('`').strip()
+
+          try:
+              analysis = json.loads(raw)
+          except json.JSONDecodeError as e:
+              print(f"::error::Failed to parse Claude response as JSON: {e}")
+              print(f"Raw response: {raw[:500]}")
+              write_output('analysis_success', 'false')
+              sys.exit(0)
+
+          with open('claude-analysis.json', 'w') as f:
+              json.dump(analysis, f, indent=2)
+
+          print("=== Claude Analysis ===")
+          print(f"  Type:       {analysis.get('error_type')}")
+          print(f"  Fix:        {analysis.get('fix_type')}")
+          print(f"  Confidence: {analysis.get('confidence')}")
+          print(f"  Summary:    {analysis.get('error_summary')}")
+
+          write_output('analysis_success', 'true')
+          write_output('error_type', analysis.get('error_type', 'other'))
+          write_output('fix_type', analysis.get('fix_type', 'manual_required'))
+          write_output('confidence', str(analysis.get('confidence', 0)))
+          EOF
+
+      - name: Apply automated fixes
+        id: apply-fixes
+        if: |
+          steps.analyze.outputs.analysis_success == 'true' &&
+          steps.analyze.outputs.fix_type != 'manual_required' &&
+          steps.analyze.outputs.fix_type != 'config_change'
+        run: |
+          python3 << 'EOF'
+          import json, os, sys
+
+          CONFIDENCE_THRESHOLD = 0.85
+          GITHUB_OUTPUT = os.environ['GITHUB_OUTPUT']
+
+          with open('claude-analysis.json') as f:
+              analysis = json.load(f)
+
+          confidence = float(analysis.get('confidence', 0))
+          if confidence < CONFIDENCE_THRESHOLD:
+              print(f"Confidence {confidence:.0%} is below threshold {CONFIDENCE_THRESHOLD:.0%} — skipping auto-apply.")
+              with open(GITHUB_OUTPUT, 'a') as f:
+                  f.write("fixes_applied=false\n")
+                  f.write("low_confidence=true\n")
+              sys.exit(0)
+
+          changes = analysis.get('fix_changes', [])
+          if not changes:
+              print("No fix_changes provided by Claude.")
+              with open(GITHUB_OUTPUT, 'a') as f:
+                  f.write("fixes_applied=false\n")
+              sys.exit(0)
+
+          applied = []
+          skipped = []
+
+          for change in changes:
+              filepath = change.get('file', '').strip()
+              search = change.get('search', '')
+              replace = change.get('replace', '')
+
+              if not (filepath and search):
+                  print(f"::warning::Skipping incomplete change entry: {change}")
+                  continue
+
+              if not os.path.exists(filepath):
+                  print(f"::warning::File not found: {filepath}")
+                  skipped.append(filepath)
+                  continue
+
+              with open(filepath, 'r') as f:
+                  content = f.read()
+
+              count = content.count(search)
+              if count == 0:
+                  print(f"::warning::Search string not found in {filepath}: {search[:80]!r}")
+                  skipped.append(filepath)
+                  continue
+              if count > 1:
+                  print(f"::warning::Search string ambiguous ({count} matches) in {filepath} — skipping")
+                  skipped.append(filepath)
+                  continue
+
+              new_content = content.replace(search, replace, 1)
+              with open(filepath, 'w') as f:
+                  f.write(new_content)
+              applied.append(filepath)
+              print(f"✓ Applied fix to {filepath}")
+
+          with open(GITHUB_OUTPUT, 'a') as f:
+              f.write(f"fixes_applied={'true' if applied else 'false'}\n")
+              f.write(f"applied_files={','.join(applied)}\n")
+
+          if skipped:
+              print(f"Skipped {len(skipped)} change(s): {skipped}")
+          if applied:
+              print(f"Successfully applied {len(applied)} fix(es).")
+          else:
+              print("No fixes could be applied automatically.")
+          EOF
+
+      - name: Create Pull Request with automated fix
+        if: steps.apply-fixes.outputs.fixes_applied == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="auto-fix/build-run-${FAILED_RUN_NUMBER}-$(date +%Y%m%d-%H%M)"
+          git checkout -b "$BRANCH"
+          git add -A
+
+          SUMMARY=$(jq -r '.error_summary' claude-analysis.json)
+          git commit -m "fix: Auto-fix build error (Run #${FAILED_RUN_NUMBER})
+
+${SUMMARY}
+
+Triggered by: ${FAILED_RUN_URL}"
+
+          git push origin "$BRANCH"
+
+          ROOT_CAUSE=$(jq -r '.root_cause' claude-analysis.json)
+          FIX_DESC=$(jq -r '.fix_description' claude-analysis.json)
+          CONFIDENCE=$(jq -r '(.confidence * 100 | floor | tostring) + "%"' claude-analysis.json)
+          ERROR_TYPE=$(jq -r '.error_type' claude-analysis.json)
+          APPLIED=$(echo "${{ steps.apply-fixes.outputs.applied_files }}" \
+            | tr ',' '\n' | sed 's/^/- `/' | sed 's/$/`/')
+
+          gh pr create \
+            --base "${FAILED_BRANCH}" \
+            --head "${BRANCH}" \
+            --title "Auto-fix: ${SUMMARY}" \
+            --body "## Automated Build Fix
+
+**Triggered by:** [Build Run #${FAILED_RUN_NUMBER}](${FAILED_RUN_URL})
+**Branch:** \`${FAILED_BRANCH}\`
+**Error Type:** \`${ERROR_TYPE}\`
+
+## Analysis (Claude AI — confidence: ${CONFIDENCE})
+
+**Root Cause:**
+${ROOT_CAUSE}
+
+**Applied Fix:**
+${FIX_DESC}
+
+## Changed Files
+${APPLIED}
+
+---
+> **Review before merging!** This PR was created automatically.
+> If the fix looks incorrect, close this PR and fix manually.
+> Claude's full analysis: \`claude-analysis.json\` in this run's artifacts."
+
+      - name: Upload Claude analysis as artifact
+        if: steps.analyze.outputs.analysis_success == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-analysis
+          path: claude-analysis.json
+          retention-days: 30
+
+      - name: Create issue for manual fix required
+        if: |
+          steps.analyze.outputs.analysis_success == 'true' &&
+          steps.apply-fixes.outputs.fixes_applied != 'true'
+        run: |
+          SUMMARY=$(jq -r '.error_summary' claude-analysis.json)
+          ROOT_CAUSE=$(jq -r '.root_cause' claude-analysis.json)
+          FIX_DESC=$(jq -r '.fix_description' claude-analysis.json)
+          USER_ACTION=$(jq -r '.user_action_required' claude-analysis.json)
+          ERROR_TYPE=$(jq -r '.error_type' claude-analysis.json)
+          CONFIDENCE=$(jq -r '(.confidence * 100 | floor | tostring) + "%"' claude-analysis.json)
+          LOW_CONF="${{ steps.apply-fixes.outputs.low_confidence }}"
+
+          NOTE=""
+          if [ "$LOW_CONF" = "true" ]; then
+            NOTE="> Note: An automated fix was suggested but confidence (${CONFIDENCE}) was below the 85% threshold for auto-apply."
+          fi
+
+          gh issue create \
+            --title "Build Failed (#${FAILED_RUN_NUMBER}): ${SUMMARY}" \
+            --label "bug" \
+            --body "## Build Failure Report
+
+**Failed Run:** [Build #${FAILED_RUN_NUMBER}](${FAILED_RUN_URL})
+**Branch:** \`${FAILED_BRANCH}\`
+**Error Type:** \`${ERROR_TYPE}\`
+
+${NOTE}
+
+## AI Analysis (Claude — confidence: ${CONFIDENCE})
+
+### Root Cause
+${ROOT_CAUSE}
+
+### Recommended Fix
+${FIX_DESC}
+
+### Action Required
+${USER_ACTION}
+
+---
+*Automatically created by the Auto-Fix workflow (Run #${FAILED_RUN_NUMBER}).*" \
+          || echo "::notice::Issue may already exist for this error type — skipping creation"
+
+      - name: Notify if API key is missing
+        if: |
+          steps.analyze.outputs.analysis_success == 'false' &&
+          steps.analyze.outputs.skip_reason == 'no_api_key'
+        run: |
+          gh issue create \
+            --title "Build Failed (#${FAILED_RUN_NUMBER}) — Add ANTHROPIC_API_KEY for auto-analysis" \
+            --label "bug" \
+            --body "## Build Failure
+
+**Failed Run:** [Build #${FAILED_RUN_NUMBER}](${FAILED_RUN_URL})
+**Branch:** \`${FAILED_BRANCH}\`
+
+## Auto-Analysis is Disabled
+
+The Auto-Fix workflow requires an \`ANTHROPIC_API_KEY\` secret to analyze errors.
+
+**To enable AI-powered auto-fix:**
+1. Get a key from https://console.anthropic.com/
+2. Add it as a repository secret named \`ANTHROPIC_API_KEY\`
+   - Go to: Settings → Secrets and variables → Actions → New repository secret
+3. Re-run the failed build
+
+---
+*Automatically created by the Auto-Fix workflow.*" \
+          || echo "::notice::Issue already exists — skipping creation"
