@@ -101,7 +101,7 @@ jobs:
                   headers=headers, allow_redirects=True, timeout=60
               )
               if log_resp.status_code == 200:
-                  return log_resp.text[-20000:]  # last 20 KB (most relevant errors)
+                  return log_resp.text[-6000:]  # last 6 KB — errors are always at the end
               return None
 
           # --- Collect error log ---
@@ -110,7 +110,7 @@ jobs:
           log_file = find_artifact_log()
           if log_file:
               with open(log_file, 'rb') as f:
-                  error_log = f.read().decode('utf-8', errors='replace')[-15000:]
+                  error_log = f.read().decode('utf-8', errors='replace')[-6000:]
               log_source = log_file
               print(f"Using artifact log: {log_file} ({len(error_log)} chars)")
           else:
@@ -121,15 +121,9 @@ jobs:
 
           # --- Collect workflow context ---
           try:
-              commits = subprocess.check_output(['git', 'log', '--oneline', '-10'], text=True)
+              commits = subprocess.check_output(['git', 'log', '--oneline', '-5'], text=True)
           except Exception:
               commits = '(unavailable)'
-
-          try:
-              with open('.github/workflows/build_iAPS.yml') as f:
-                  build_wf = f.read()[:4000]
-          except Exception:
-              build_wf = '(unavailable)'
 
           # --- Check API key ---
           if not ANTHROPIC_KEY:
@@ -140,35 +134,19 @@ jobs:
 
           # --- Call Claude API ---
           system_prompt = (
-              "You are a senior iOS/Swift build engineer specializing in the iAPS (FreeAPS X) "
-              "closed-loop insulin delivery app. iAPS is built with Xcode + Fastlane and distributed "
-              "via TestFlight. You analyze CI/CD build failures and return structured JSON with precise, "
-              "actionable fixes. Common failure causes: wrong Xcode version in workflow, Swift Package "
-              "Manager dependency failures, code signing / provisioning issues, Swift compilation errors "
-              "after upstream merges, Fastlane API credential issues, expired certificates."
+              "iOS/Swift build engineer for iAPS (FreeAPS X), built with Xcode+Fastlane→TestFlight. "
+              "Analyze CI failures, return JSON fixes. Common causes: wrong Xcode version, SPM failures, "
+              "code signing issues, Swift errors after upstream merges, Fastlane/cert issues."
           )
           user_msg = (
-              f"A GitHub Actions build failed on branch `{BRANCH}`.\n\n"
-              f"**Recent commits:**\n```\n{commits}\n```\n\n"
-              f"**Current .github/workflows/build_iAPS.yml (first 4000 chars):**\n```yaml\n{build_wf}\n```\n\n"
-              f"**Build error log (last portion):**\n```\n{error_log}\n```\n\n"
-              "Return ONLY a JSON object — no markdown, no explanation — with these exact keys:\n"
-              "{\n"
-              '  "error_summary": "1-2 sentence summary",\n'
-              '  "error_type": "xcode_version|swift_compilation|code_signing|spm_dependency|fastlane|credentials|other",\n'
-              '  "root_cause": "Detailed root cause explanation",\n'
-              '  "fix_type": "workflow_change|code_change|config_change|manual_required",\n'
-              '  "fix_description": "What must be changed to fix this",\n'
-              '  "fix_changes": [\n'
-              '    {"file": "path/to/file", "search": "exact unique string to find", "replace": "replacement string"}\n'
-              "  ],\n"
-              '  "confidence": 0.0,\n'
-              '  "user_action_required": "What the user must do manually (empty string if nothing)"\n'
-              "}\n\n"
-              "Rules for fix_changes:\n"
-              "- Only include if fix_type is workflow_change or code_change AND you are highly confident\n"
-              "- search must be unique enough to match exactly one location in the file\n"
-              "- confidence >= 0.85 triggers automatic PR creation, so be conservative\n"
+              f"Build failed on `{BRANCH}`. Recent commits:\n```\n{commits}\n```\n\n"
+              f"Error log (tail):\n```\n{error_log}\n```\n\n"
+              "Return ONLY JSON:\n"
+              '{"error_summary":"...","error_type":"xcode_version|swift_compilation|code_signing|spm_dependency|fastlane|credentials|other",'
+              '"root_cause":"...","fix_type":"workflow_change|code_change|config_change|manual_required",'
+              '"fix_description":"...","fix_changes":[{"file":"...","search":"...","replace":"..."}],'
+              '"confidence":0.0,"user_action_required":"..."}\n\n'
+              "fix_changes only if confidence>=0.85. search must be unique in the file."
           )
 
           resp = requests.post(
@@ -179,8 +157,8 @@ jobs:
                   'content-type': 'application/json',
               },
               json={
-                  'model': 'claude-opus-4-6',
-                  'max_tokens': 2048,
+                  'model': 'claude-sonnet-4-6',
+                  'max_tokens': 1024,
                   'system': system_prompt,
                   'messages': [{'role': 'user', 'content': user_msg}],
               },

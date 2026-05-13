@@ -71,7 +71,7 @@ jobs:
               --arg branch "${{ github.ref_name }}" \
               '{
                 model: "claude-haiku-4-5-20251001",
-                max_tokens: 1024,
+                max_tokens: 400,
                 messages: [{
                   role: "user",
                   content: ("Analysiere diese neuen Commits im iAPS Upstream-Repository (Branch: " + $branch + ") und schreibe eine kurze Zusammenfassung auf Deutsch für einen Diabetiker der diese App nutzt. Fokus auf: neue Features, Bug-Fixes, Sicherheitsrelevantes, Breaking Changes.\n\nCommits:\n" + $commits + "\n\nGeänderte Dateien:\n" + $diff)
