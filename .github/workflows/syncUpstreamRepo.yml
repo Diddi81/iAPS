@@ -53,98 +53,44 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT }}
           ref: ${{ github.ref_name }}
-          fetch-depth: 50  # enough to diff recent changes
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: pip install requests --quiet
+          fetch-depth: 20
 
       - name: Analyze upstream changes with Claude
         id: analyze-changes
         run: |
-          python3 << 'EOF'
-          import os, subprocess, requests, json, sys
+          COMMITS=$(git log --oneline -20 origin/${{ github.ref_name }} 2>/dev/null || echo "(unavailable)")
+          DIFF_STAT=$(git diff --stat HEAD~5 HEAD 2>/dev/null || echo "(unavailable)")
 
-          GITHUB_OUTPUT = os.environ['GITHUB_OUTPUT']
-          ANTHROPIC_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
-          UPSTREAM_URL = os.environ.get('UPSTREAM_URL', 'https://github.com/Artificial-Pancreas/iAPS.git')
-          BRANCH = os.environ.get('GITHUB_REF_NAME', 'main')
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "Kein ANTHROPIC_API_KEY — einfache Zusammenfassung"
+            printf 'Neue Commits wurden synchronisiert:\n\n```\n%s\n```' "$COMMITS" > sync-summary.txt
+          else
+            PAYLOAD=$(jq -n \
+              --arg commits "$COMMITS" \
+              --arg diff "$DIFF_STAT" \
+              --arg branch "${{ github.ref_name }}" \
+              '{
+                model: "claude-haiku-4-5-20251001",
+                max_tokens: 1024,
+                messages: [{
+                  role: "user",
+                  content: ("Analysiere diese neuen Commits im iAPS Upstream-Repository (Branch: " + $branch + ") und schreibe eine kurze Zusammenfassung auf Deutsch für einen Diabetiker der diese App nutzt. Fokus auf: neue Features, Bug-Fixes, Sicherheitsrelevantes, Breaking Changes.\n\nCommits:\n" + $commits + "\n\nGeänderte Dateien:\n" + $diff)
+                }]
+              }')
 
-          def write_output(key, value):
-              with open(GITHUB_OUTPUT, 'a') as f:
-                  f.write(f"{key}={value}\n")
+            RESPONSE=$(curl -s -X POST https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              -d "$PAYLOAD")
 
-          # Get the new commits from upstream (commits ahead of previous state)
-          try:
-              # Fetch upstream to compare
-              subprocess.run(['git', 'remote', 'add', 'upstream', UPSTREAM_URL],
-                           capture_output=True, check=False)
-              subprocess.run(['git', 'fetch', 'upstream', BRANCH, '--depth=30'],
-                           capture_output=True, check=False)
-
-              # Get commits that were just synced (last 20 commits on the branch)
-              commits_raw = subprocess.check_output(
-                  ['git', 'log', '--oneline', '-20', f'origin/{BRANCH}'],
-                  text=True
-              )
-
-              # Get diff summary of recent changes
-              diff_stat = subprocess.check_output(
-                  ['git', 'diff', '--stat', 'HEAD~10', 'HEAD'],
-                  text=True
-              )
-          except Exception as e:
-              print(f"Git operation failed: {e}")
-              commits_raw = "(unavailable)"
-              diff_stat = "(unavailable)"
-
-          if not ANTHROPIC_KEY:
-              print("::notice::ANTHROPIC_API_KEY not set — generating basic summary")
-              summary = f"Neue Commits von upstream wurden synchronisiert:\n\n```\n{commits_raw[:2000]}\n```"
-              write_output('summary', 'basic')
-          else:
-              resp = requests.post(
-                  'https://api.anthropic.com/v1/messages',
-                  headers={
-                      'x-api-key': ANTHROPIC_KEY,
-                      'anthropic-version': '2023-06-01',
-                      'content-type': 'application/json',
-                  },
-                  json={
-                      'model': 'claude-haiku-4-5-20251001',  # fast + cheap for summaries
-                      'max_tokens': 1024,
-                      'messages': [{
-                          'role': 'user',
-                          'content': (
-                              f"Analysiere diese neuen Commits im iAPS Upstream-Repository "
-                              f"(Branch: {BRANCH}) und schreibe eine kurze Zusammenfassung auf Deutsch "
-                              f"für einen Diabetiker der diese App nutzt. Fokus auf: neue Features, "
-                              f"Bug-Fixes, Sicherheitsrelevantes, Breaking Changes.\n\n"
-                              f"Commits:\n{commits_raw[:3000]}\n\n"
-                              f"Geänderte Dateien:\n{diff_stat[:2000]}"
-                          )
-                      }]
-                  },
-                  timeout=30
-              )
-              if resp.status_code == 200:
-                  summary = resp.json()['content'][0]['text']
-                  write_output('summary', 'ai')
-              else:
-                  summary = f"Neue Commits synchronisiert:\n```\n{commits_raw[:2000]}\n```"
-                  write_output('summary', 'basic')
-
-          # Save summary for the notification step
-          with open('sync-summary.txt', 'w') as f:
-              f.write(summary)
-
-          print("=== Upstream Sync Summary ===")
-          print(summary[:500])
-          EOF
+            SUMMARY=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+            if [ -z "$SUMMARY" ]; then
+              printf 'Neue Commits synchronisiert:\n\n```\n%s\n```' "$COMMITS" > sync-summary.txt
+            else
+              echo "$SUMMARY" > sync-summary.txt
+            fi
+          fi
 
       - name: Create sync notification issue
         run: |

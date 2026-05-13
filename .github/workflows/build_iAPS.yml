@@ -11,7 +11,9 @@ on:
   # workflow is triggered, but doesn't actually do anything.
   #
   push:
-  
+    branches:
+      - main
+
 env:  
   UPSTREAM_REPO: Artificial-Pancreas/iAPS
   UPSTREAM_BRANCH: ${{ github.ref_name }} # branch on upstream repository to sync from (replace with specific branch name if needed)
