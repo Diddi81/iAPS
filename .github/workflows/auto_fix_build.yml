@@ -313,11 +313,8 @@ jobs:
           git add -A
 
           SUMMARY=$(jq -r '.error_summary' claude-analysis.json)
-          git commit -m "fix: Auto-fix build error (Run #${FAILED_RUN_NUMBER})
-
-${SUMMARY}
-
-Triggered by: ${FAILED_RUN_URL}"
+          git commit -m "$(printf 'fix: Auto-fix build error (Run #%s)\n\n%s\n\nTriggered by: %s' \
+            "${FAILED_RUN_NUMBER}" "${SUMMARY}" "${FAILED_RUN_URL}")"
 
           git push origin "$BRANCH"
 
@@ -328,31 +325,15 @@ Triggered by: ${FAILED_RUN_URL}"
           APPLIED=$(echo "${{ steps.apply-fixes.outputs.applied_files }}" \
             | tr ',' '\n' | sed 's/^/- `/' | sed 's/$/`/')
 
+          printf '## Automated Build Fix\n\n**Triggered by:** [Build Run #%s](%s)\n**Branch:** `%s`\n**Error Type:** `%s`\n\n## Analysis (Claude AI — confidence: %s)\n\n**Root Cause:**\n%s\n\n**Applied Fix:**\n%s\n\n## Changed Files\n%s\n\n---\n> **Review before merging!** This PR was created automatically.\n> If the fix looks incorrect, close this PR and fix manually.\n> Claude'"'"'s full analysis: `claude-analysis.json` in this run'"'"'s artifacts.' \
+            "${FAILED_RUN_NUMBER}" "${FAILED_RUN_URL}" "${FAILED_BRANCH}" "${ERROR_TYPE}" \
+            "${CONFIDENCE}" "${ROOT_CAUSE}" "${FIX_DESC}" "${APPLIED}" > /tmp/pr-body.md
+
           gh pr create \
             --base "${FAILED_BRANCH}" \
             --head "${BRANCH}" \
             --title "Auto-fix: ${SUMMARY}" \
-            --body "## Automated Build Fix
-
-**Triggered by:** [Build Run #${FAILED_RUN_NUMBER}](${FAILED_RUN_URL})
-**Branch:** \`${FAILED_BRANCH}\`
-**Error Type:** \`${ERROR_TYPE}\`
-
-## Analysis (Claude AI — confidence: ${CONFIDENCE})
-
-**Root Cause:**
-${ROOT_CAUSE}
-
-**Applied Fix:**
-${FIX_DESC}
-
-## Changed Files
-${APPLIED}
-
----
-> **Review before merging!** This PR was created automatically.
-> If the fix looks incorrect, close this PR and fix manually.
-> Claude's full analysis: \`claude-analysis.json\` in this run's artifacts."
+            --body-file /tmp/pr-body.md
 
       - name: Upload Claude analysis as artifact
         if: steps.analyze.outputs.analysis_success == 'true'
@@ -380,30 +361,15 @@ ${APPLIED}
             NOTE="> Note: An automated fix was suggested but confidence (${CONFIDENCE}) was below the 85% threshold for auto-apply."
           fi
 
+          printf '## Build Failure Report\n\n**Failed Run:** [Build #%s](%s)\n**Branch:** `%s`\n**Error Type:** `%s`\n\n%s\n\n## AI Analysis (Claude — confidence: %s)\n\n### Root Cause\n%s\n\n### Recommended Fix\n%s\n\n### Action Required\n%s\n\n---\n*Automatically created by the Auto-Fix workflow (Run #%s).*' \
+            "${FAILED_RUN_NUMBER}" "${FAILED_RUN_URL}" "${FAILED_BRANCH}" "${ERROR_TYPE}" \
+            "${NOTE}" "${CONFIDENCE}" "${ROOT_CAUSE}" "${FIX_DESC}" "${USER_ACTION}" \
+            "${FAILED_RUN_NUMBER}" > /tmp/issue-body.md
+
           gh issue create \
             --title "Build Failed (#${FAILED_RUN_NUMBER}): ${SUMMARY}" \
             --label "bug" \
-            --body "## Build Failure Report
-
-**Failed Run:** [Build #${FAILED_RUN_NUMBER}](${FAILED_RUN_URL})
-**Branch:** \`${FAILED_BRANCH}\`
-**Error Type:** \`${ERROR_TYPE}\`
-
-${NOTE}
-
-## AI Analysis (Claude — confidence: ${CONFIDENCE})
-
-### Root Cause
-${ROOT_CAUSE}
-
-### Recommended Fix
-${FIX_DESC}
-
-### Action Required
-${USER_ACTION}
-
----
-*Automatically created by the Auto-Fix workflow (Run #${FAILED_RUN_NUMBER}).*" \
+            --body-file /tmp/issue-body.md \
           || echo "::notice::Issue may already exist for this error type — skipping creation"
 
       - name: Notify if API key is missing
@@ -411,24 +377,11 @@ ${USER_ACTION}
           steps.analyze.outputs.analysis_success == 'false' &&
           steps.analyze.outputs.skip_reason == 'no_api_key'
         run: |
+          printf '## Build Failure\n\n**Failed Run:** [Build #%s](%s)\n**Branch:** `%s`\n\n## Auto-Analysis is Disabled\n\nThe Auto-Fix workflow requires an `ANTHROPIC_API_KEY` secret to analyze errors.\n\n**To enable AI-powered auto-fix:**\n1. Get a key from https://console.anthropic.com/\n2. Add it as a repository secret named `ANTHROPIC_API_KEY`\n   - Go to: Settings → Secrets and variables → Actions → New repository secret\n3. Re-run the failed build\n\n---\n*Automatically created by the Auto-Fix workflow.*' \
+            "${FAILED_RUN_NUMBER}" "${FAILED_RUN_URL}" "${FAILED_BRANCH}" > /tmp/nokey-body.md
+
           gh issue create \
             --title "Build Failed (#${FAILED_RUN_NUMBER}) — Add ANTHROPIC_API_KEY for auto-analysis" \
             --label "bug" \
-            --body "## Build Failure
-
-**Failed Run:** [Build #${FAILED_RUN_NUMBER}](${FAILED_RUN_URL})
-**Branch:** \`${FAILED_BRANCH}\`
-
-## Auto-Analysis is Disabled
-
-The Auto-Fix workflow requires an \`ANTHROPIC_API_KEY\` secret to analyze errors.
-
-**To enable AI-powered auto-fix:**
-1. Get a key from https://console.anthropic.com/
-2. Add it as a repository secret named \`ANTHROPIC_API_KEY\`
-   - Go to: Settings → Secrets and variables → Actions → New repository secret
-3. Re-run the failed build
-
----
-*Automatically created by the Auto-Fix workflow.*" \
+            --body-file /tmp/nokey-body.md \
           || echo "::notice::Issue already exists — skipping creation"

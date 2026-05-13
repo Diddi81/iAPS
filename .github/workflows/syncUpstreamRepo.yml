@@ -153,27 +153,13 @@ jobs:
           BRANCH="${{ github.ref_name }}"
           REPO="${{ github.repository }}"
 
+          printf '## Upstream Sync Bericht\n\n**Datum:** %s\n**Branch:** `%s`\n**Upstream:** [Artificial-Pancreas/iAPS](https://github.com/Artificial-Pancreas/iAPS)\n\n## Was hat sich geändert?\n\n%s\n\n## Nächste Schritte\n\n- [ ] Änderungen prüfen\n- [ ] [Build manuell starten](https://github.com/%s/actions/workflows/build_iAPS.yml) (falls nicht automatisch)\n- [ ] IPA auf TestFlight testen\n\n---\n*Automatisch erstellt durch den Sync-Workflow.*' \
+            "$DATE" "$BRANCH" "$SUMMARY" "$REPO" > /tmp/sync-body.md
+
           gh issue create \
             --title "Upstream Sync: Neue Änderungen am ${DATE} (Branch: ${BRANCH})" \
             --label "sync" \
-            --body "## Upstream Sync Bericht
-
-**Datum:** ${DATE}
-**Branch:** \`${BRANCH}\`
-**Upstream:** [Artificial-Pancreas/iAPS](https://github.com/Artificial-Pancreas/iAPS)
-
-## Was hat sich geändert?
-
-${SUMMARY}
-
-## Nächste Schritte
-
-- [ ] Änderungen prüfen
-- [ ] [Build manuell starten](https://github.com/${REPO}/actions/workflows/build_iAPS.yml) (falls nicht automatisch)
-- [ ] IPA auf TestFlight testen
-
----
-*Automatisch erstellt durch den Sync-Workflow.*" \
+            --body-file /tmp/sync-body.md \
           || echo "::notice::Issue-Erstellung übersprungen (möglicherweise existiert bereits eines)"
 
   trigger-build:
