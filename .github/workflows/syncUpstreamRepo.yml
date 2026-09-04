@@ -28,7 +28,7 @@ jobs:
     steps:
       - name: GitHub Sync to Upstream Repository
         id: sync-action
-        uses: Artificial-Pancreas/sync-upstream-repo@master
+        uses: Artificial-Pancreas/sync-upstream-repo@f00322acdc3c9d7880937c2aa245aca2105a9f2c # master (2026-09-04) - no tagged releases exist upstream
         with:
           upstream_repo: ${{ env.UPSTREAM_URL }}
           upstream_branch: ${{ env.UPSTREAM_BRANCH }}
