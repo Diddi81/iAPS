@@ -36,13 +36,21 @@ jobs:
 
       - name: Set special variables
         env:
-          # APP_IDENTIFIER may be set as a secret (preferred) or a repository variable (fallback).
+          # Preferred: set APP_IDENTIFIER_PREFIX (repository variable, e.g. "de.dpamin") and
+          # let Fastlane combine it with the live TEAMID secret at build time, so the bundle
+          # identifier can never drift out of sync with the signing team. APP_IDENTIFIER may
+          # still be set (as a secret or repository variable) to override the whole identifier
+          # for edge cases; the secret wins over the variable, and either wins over the prefix.
           APP_IDENTIFIER_SECRET: ${{ secrets.APP_IDENTIFIER }}
           APP_IDENTIFIER_VAR: ${{ vars.APP_IDENTIFIER }}
+          APP_IDENTIFIER_PREFIX_VAR: ${{ vars.APP_IDENTIFIER_PREFIX }}
         run: |
           APP_ID="${APP_IDENTIFIER_SECRET:-$APP_IDENTIFIER_VAR}"
           if [ -n "$APP_ID" ]; then
             echo "APP_IDENTIFIER=$APP_ID" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$APP_IDENTIFIER_PREFIX_VAR" ]; then
+            echo "APP_IDENTIFIER_PREFIX=$APP_IDENTIFIER_PREFIX_VAR" >> "$GITHUB_ENV"
           fi
 
       # Ensure compatible Bundler version for Fastlane (fastlane requires bundler < 3)

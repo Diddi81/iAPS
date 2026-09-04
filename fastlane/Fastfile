@@ -23,7 +23,11 @@ DEVICE_NAME = ENV["DEVICE_NAME"]
 DEVICE_ID = ENV["DEVICE_ID"]
 ENV["FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT"] = "120"
 
-APP_IDENTIFIER = ENV.fetch('APP_IDENTIFIER') { "ru.artpancreas.#{TEAMID}.FreeAPS" }
+# Built from APP_IDENTIFIER_PREFIX + the live TEAMID secret so the identifier can never
+# drift out of sync with the actual signing team (e.g. after a Team ID rotation).
+# APP_IDENTIFIER may still be set directly to override the whole identifier for edge cases
+# that don't fit the "<prefix>.<TEAMID>.FreeAPS" pattern.
+APP_IDENTIFIER = ENV.fetch('APP_IDENTIFIER') { "#{ENV.fetch('APP_IDENTIFIER_PREFIX', 'ru.artpancreas')}.#{TEAMID}.FreeAPS" }
 
 if ENV['BUILD_GROUP']
   File.write('../ConfigOverride.xcconfig', "COPYRIGHT_NOTICE = #{ENV['BUILD_GROUP']}\n", mode: 'a')
