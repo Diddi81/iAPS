@@ -18,7 +18,6 @@ env:
   UPSTREAM_REPO: Artificial-Pancreas/iAPS
   UPSTREAM_BRANCH: ${{ github.ref_name }} # branch on upstream repository to sync from (replace with specific branch name if needed)
   TARGET_BRANCH: ${{ github.ref_name }} # target branch on fork to be kept in sync, and target branch on upstream to be kept alive (replace with specific branch name if needed)
-  ALIVE_BRANCH: alive
 
 jobs:
   auto_build_check:
@@ -49,50 +48,31 @@ jobs:
     if: needs.auto_build_check.outputs.AUTO_BUILD_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/create_certs.yml
     secrets: inherit
-  check_latest_from_upstream:
-    needs: [check_certs]
-    runs-on: ubuntu-latest
-    name: Check upstream
-    outputs: 
-      NEW_COMMITS: ${{ steps.sync.outputs.has_new_commits }}
-    
-    steps:
-    - name: Checkout target repo
-      if: |
-        needs.check_alive_and_permissions.outputs.WORKFLOW_PERMISSION == 'true' &&
-        (vars.SCHEDULED_BUILD != 'false' || vars.SCHEDULED_SYNC != 'false')
-      uses: actions/checkout@v5
-      with:
-        token: ${{ secrets.GH_PAT }}
-        ref: alive
-  
   # Builds iAPS
   build:
     name: Build
-    needs: [check_certs,check_latest_from_upstream]
+    needs: [check_certs]
     runs-on: macos-latest
     permissions:
       contents: write
     steps:
-      - name: Set special variables
+      # Bootstrap checkout so the local ./.github/actions/resolve-app-identifier composite
+      # action is available on the runner. "Checkout Repo for building" below re-checks out
+      # the repo (with submodules, at TARGET_BRANCH) before anything else reads its contents.
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+
+      - name: Resolve APP_IDENTIFIER
+        uses: ./.github/actions/resolve-app-identifier
+        with:
+          app-identifier-secret: ${{ secrets.APP_IDENTIFIER }}
+          app-identifier-var: ${{ vars.APP_IDENTIFIER }}
+          app-identifier-prefix: ${{ vars.APP_IDENTIFIER_PREFIX }}
+
+      - name: Set BUILD_GROUP
         env:
-          # Preferred: set APP_IDENTIFIER_PREFIX (repository variable, e.g. "de.dpamin") and
-          # let Fastlane combine it with the live TEAMID secret at build time, so the bundle
-          # identifier can never drift out of sync with the signing team. APP_IDENTIFIER may
-          # still be set (as a secret or repository variable) to override the whole identifier
-          # for edge cases; the secret wins over the variable, and either wins over the prefix.
-          APP_IDENTIFIER_SECRET: ${{ secrets.APP_IDENTIFIER }}
-          APP_IDENTIFIER_VAR: ${{ vars.APP_IDENTIFIER }}
-          APP_IDENTIFIER_PREFIX_VAR: ${{ vars.APP_IDENTIFIER_PREFIX }}
           BUILD_GROUP_VAR: ${{ vars.BUILD_GROUP }}
         run: |
-          APP_ID="${APP_IDENTIFIER_SECRET:-$APP_IDENTIFIER_VAR}"
-          if [ -n "$APP_ID" ]; then
-            echo "APP_IDENTIFIER=$APP_ID" >> "$GITHUB_ENV"
-          fi
-          if [ -n "$APP_IDENTIFIER_PREFIX_VAR" ]; then
-            echo "APP_IDENTIFIER_PREFIX=$APP_IDENTIFIER_PREFIX_VAR" >> "$GITHUB_ENV"
-          fi
           if [ -n "$BUILD_GROUP_VAR" ]; then
             echo "BUILD_GROUP=$BUILD_GROUP_VAR" >> "$GITHUB_ENV"
           fi

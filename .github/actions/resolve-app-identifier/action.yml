@@ -1,0 +1,42 @@
+name: Resolve APP_IDENTIFIER
+description: >
+  Resolves the iAPS bundle identifier and exports it as the APP_IDENTIFIER
+  environment variable for later steps in the same job. Preferred: pass only
+  app-identifier-prefix, so Fastlane combines it with the live TEAMID secret
+  at build time and the bundle ID's team segment can never drift out of sync
+  with the signing team. app-identifier-secret / app-identifier-var override
+  the whole identifier for edge cases that don't fit the
+  "<prefix>.<TEAMID>.FreeAPS" pattern; the secret wins over the variable, and
+  either wins over the prefix.
+
+inputs:
+  app-identifier-secret:
+    description: Full bundle identifier override, from a repository secret.
+    required: false
+    default: ''
+  app-identifier-var:
+    description: Full bundle identifier override, from a repository variable.
+    required: false
+    default: ''
+  app-identifier-prefix:
+    description: Bundle identifier prefix (e.g. "de.dpamin"), combined with TEAMID by Fastlane.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Set APP_IDENTIFIER / APP_IDENTIFIER_PREFIX
+      shell: bash
+      env:
+        APP_IDENTIFIER_SECRET: ${{ inputs.app-identifier-secret }}
+        APP_IDENTIFIER_VAR: ${{ inputs.app-identifier-var }}
+        APP_IDENTIFIER_PREFIX_VAR: ${{ inputs.app-identifier-prefix }}
+      run: |
+        APP_ID="${APP_IDENTIFIER_SECRET:-$APP_IDENTIFIER_VAR}"
+        if [ -n "$APP_ID" ]; then
+          echo "APP_IDENTIFIER=$APP_ID" >> "$GITHUB_ENV"
+        fi
+        if [ -n "$APP_IDENTIFIER_PREFIX_VAR" ]; then
+          echo "APP_IDENTIFIER_PREFIX=$APP_IDENTIFIER_PREFIX_VAR" >> "$GITHUB_ENV"
+        fi
