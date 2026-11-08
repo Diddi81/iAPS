@@ -39,6 +39,19 @@ jobs:
           push_args: ${{ env.PUSH_ARGS }}
           spawn_logs: ${{ env.SPAWN_LOGS }}
 
+      # The sync action exits 0 even when its merge hits a conflict, so verify the result.
+      - name: Verify upstream is fully merged
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          UPSTREAM_OWNER=$(echo "$UPSTREAM_URL" | sed -E 's#https://github.com/([^/]+)/.*#\1#')
+          STATUS=$(gh api "repos/${{ github.repository }}/compare/${UPSTREAM_OWNER}:${UPSTREAM_BRANCH}...${{ github.repository_owner }}:${DOWNSTREAM_BRANCH}" --jq '.status')
+          echo "Fork vs. upstream: $STATUS"
+          if [ "$STATUS" != "ahead" ] && [ "$STATUS" != "identical" ]; then
+            echo "::error::Upstream-Sync unvollständig (Status: $STATUS) – vermutlich Merge-Konflikt. Bitte manuell mergen."
+            exit 1
+          fi
+
   summarize-changes:
     name: Summarize & Notify Changes
     needs: sync
