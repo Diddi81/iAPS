@@ -24,10 +24,17 @@ jobs:
     name: Sync from Upstream
     runs-on: ubuntu-latest
     outputs:
-      has_new_commits: ${{ steps.sync-action.outputs.has_new_commits }}
+      has_new_commits: ${{ steps.detect.outputs.has_new_commits }}
+      before: ${{ steps.before.outputs.sha }}
+      after: ${{ steps.detect.outputs.after }}
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
     steps:
+      - name: Record branch head before sync
+        id: before
+        run: echo "sha=$(gh api repos/${{ github.repository }}/commits/${DOWNSTREAM_BRANCH} --jq .sha)" >> "$GITHUB_OUTPUT"
+
       - name: GitHub Sync to Upstream Repository
-        id: sync-action
         uses: Artificial-Pancreas/sync-upstream-repo@f00322acdc3c9d7880937c2aa245aca2105a9f2c # master (2026-09-04) - no tagged releases exist upstream
         with:
           upstream_repo: ${{ env.UPSTREAM_URL }}
@@ -41,8 +48,6 @@ jobs:
 
       # The sync action exits 0 even when its merge hits a conflict, so verify the result.
       - name: Verify upstream is fully merged
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           UPSTREAM_OWNER=$(echo "$UPSTREAM_URL" | sed -E 's#https://github.com/([^/]+)/.*#\1#')
           STATUS=$(gh api "repos/${{ github.repository }}/compare/${UPSTREAM_OWNER}:${UPSTREAM_BRANCH}...${{ github.repository_owner }}:${DOWNSTREAM_BRANCH}" --jq '.status')
@@ -52,6 +57,20 @@ jobs:
             exit 1
           fi
 
+      # The sync action does not expose whether it merged anything, so compare heads.
+      - name: Detect new commits
+        id: detect
+        run: |
+          AFTER=$(gh api repos/${{ github.repository }}/commits/${DOWNSTREAM_BRANCH} --jq .sha)
+          echo "after=$AFTER" >> "$GITHUB_OUTPUT"
+          if [ "$AFTER" != "${{ steps.before.outputs.sha }}" ]; then
+            echo "has_new_commits=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_new_commits=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "before=${{ steps.before.outputs.sha }} after=$AFTER"
+
+  # The sync push to main triggers build_iAPS.yml via its push trigger; no explicit dispatch needed.
   summarize-changes:
     name: Summarize & Notify Changes
     needs: sync
@@ -61,45 +80,35 @@ jobs:
       GH_TOKEN: ${{ secrets.GH_PAT }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
-      - name: Checkout updated repository
-        uses: actions/checkout@v5
-        with:
-          token: ${{ secrets.GH_PAT }}
-          ref: ${{ github.ref_name }}
-          fetch-depth: 20
-
       - name: Analyze upstream changes with Claude
-        id: analyze-changes
         run: |
-          COMMITS=$(git log --oneline -20 origin/${{ github.ref_name }} 2>/dev/null || echo "(unavailable)")
-          DIFF_STAT=$(git diff --stat HEAD~5 HEAD 2>/dev/null || echo "(unavailable)")
+          gh api "repos/${{ github.repository }}/compare/${{ needs.sync.outputs.before }}...${{ needs.sync.outputs.after }}" > compare.json
+          COMMITS=$(jq -r '[.commits[] | select(.parents | length == 1) | "- " + (.commit.message | split("\n")[0])] | .[-60:] | .[]' compare.json)
+          FILES=$(jq -r '.files[].filename' compare.json | head -80)
+          COUNT=$(jq -r '.total_commits' compare.json)
 
           if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "Kein ANTHROPIC_API_KEY — einfache Zusammenfassung"
-            printf 'Neue Commits wurden synchronisiert:\n\n```\n%s\n```' "$COMMITS" > sync-summary.txt
+            printf '%s neue Commits wurden synchronisiert:\n\n%s' "$COUNT" "$COMMITS" > sync-summary.txt
           else
             PAYLOAD=$(jq -n \
               --arg commits "$COMMITS" \
-              --arg diff "$DIFF_STAT" \
-              --arg branch "${{ github.ref_name }}" \
+              --arg files "$FILES" \
               '{
                 model: "claude-haiku-4-5-20251001",
                 max_tokens: 400,
                 messages: [{
                   role: "user",
-                  content: ("Analysiere diese neuen Commits im iAPS Upstream-Repository (Branch: " + $branch + ") und schreibe eine kurze Zusammenfassung auf Deutsch für einen Diabetiker der diese App nutzt. Fokus auf: neue Features, Bug-Fixes, Sicherheitsrelevantes, Breaking Changes.\n\nCommits:\n" + $commits + "\n\nGeänderte Dateien:\n" + $diff)
+                  content: ("Fasse diese neuen Commits im iAPS Upstream-Repository kurz auf Deutsch zusammen, für einen Diabetiker der die App nutzt. Fokus: neue Features, Bug-Fixes, Sicherheitsrelevantes, Breaking Changes.\n\nCommits:\n" + $commits + "\n\nGeänderte Dateien:\n" + $files)
                 }]
               }')
 
-            RESPONSE=$(curl -s -X POST https://api.anthropic.com/v1/messages \
+            SUMMARY=$(curl -s -X POST https://api.anthropic.com/v1/messages \
               -H "x-api-key: $ANTHROPIC_API_KEY" \
               -H "anthropic-version: 2023-06-01" \
               -H "content-type: application/json" \
-              -d "$PAYLOAD")
-
-            SUMMARY=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+              -d "$PAYLOAD" | jq -r '.content[0].text // empty')
             if [ -z "$SUMMARY" ]; then
-              printf 'Neue Commits synchronisiert:\n\n```\n%s\n```' "$COMMITS" > sync-summary.txt
+              printf '%s neue Commits wurden synchronisiert:\n\n%s' "$COUNT" "$COMMITS" > sync-summary.txt
             else
               echo "$SUMMARY" > sync-summary.txt
             fi
@@ -107,33 +116,12 @@ jobs:
 
       - name: Create sync notification issue
         run: |
-          SUMMARY=$(cat sync-summary.txt)
           DATE=$(date +"%Y-%m-%d")
-          BRANCH="${{ github.ref_name }}"
-          REPO="${{ github.repository }}"
-
-          printf '## Upstream Sync Bericht\n\n**Datum:** %s\n**Branch:** `%s`\n**Upstream:** [Artificial-Pancreas/iAPS](https://github.com/Artificial-Pancreas/iAPS)\n\n## Was hat sich geändert?\n\n%s\n\n## Nächste Schritte\n\n- [ ] Änderungen prüfen\n- [ ] [Build manuell starten](https://github.com/%s/actions/workflows/build_iAPS.yml) (falls nicht automatisch)\n- [ ] IPA auf TestFlight testen\n\n---\n*Automatisch erstellt durch den Sync-Workflow.*' \
-            "$DATE" "$BRANCH" "$SUMMARY" "$REPO" > /tmp/sync-body.md
+          printf '## Upstream Sync Bericht\n\n**Datum:** %s\n**Branch:** `%s`\n**Upstream:** [Artificial-Pancreas/iAPS](https://github.com/Artificial-Pancreas/iAPS)\n\n## Was hat sich geändert?\n\n%s\n\n## Nächste Schritte\n\nDer Build wurde automatisch gestartet: [Build-Läufe](https://github.com/%s/actions/workflows/build_iAPS.yml)\n\n---\n*Automatisch erstellt durch den Sync-Workflow.*' \
+            "$DATE" "${{ github.ref_name }}" "$(cat sync-summary.txt)" "${{ github.repository }}" > sync-body.md
 
           gh issue create \
-            --title "Upstream Sync: Neue Änderungen am ${DATE} (Branch: ${BRANCH})" \
-            --label "sync" \
-            --body-file /tmp/sync-body.md \
-          || echo "::notice::Issue-Erstellung übersprungen (möglicherweise existiert bereits eines)"
-
-  trigger-build:
-    name: Trigger Build after Sync
-    needs: sync
-    if: |
-      needs.sync.outputs.has_new_commits == 'true' &&
-      vars.AUTO_BUILD_AFTER_SYNC == 'true'
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GH_PAT }}
-    steps:
-      - name: Trigger build_iAPS workflow
-        run: |
-          gh workflow run build_iAPS.yml \
             --repo "${{ github.repository }}" \
-            --ref "${{ github.ref_name }}"
-          echo "Build workflow triggered for branch: ${{ github.ref_name }}"
+            --title "Upstream Sync: Neue Änderungen am ${DATE}" \
+            --label "sync" \
+            --body-file sync-body.md

@@ -347,8 +347,7 @@ jobs:
           gh issue create \
             --title "Build Failed (#${FAILED_RUN_NUMBER}): ${SUMMARY}" \
             --label "bug" \
-            --body-file /tmp/issue-body.md \
-          || echo "::notice::Issue may already exist for this error type — skipping creation"
+            --body-file /tmp/issue-body.md
 
       - name: Notify if API key is missing
         if: |
@@ -361,5 +360,4 @@ jobs:
           gh issue create \
             --title "Build Failed (#${FAILED_RUN_NUMBER}) — Add ANTHROPIC_API_KEY for auto-analysis" \
             --label "bug" \
-            --body-file /tmp/nokey-body.md \
-          || echo "::notice::Issue already exists — skipping creation"
+            --body-file /tmp/nokey-body.md
